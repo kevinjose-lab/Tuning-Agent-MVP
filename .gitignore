@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local runtime state and generated files
+sent_recommendations.json
+*.bak.*
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
