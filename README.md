@@ -62,6 +62,34 @@ STALE TR-ID-HERE why the previous tuning context is no longer valid
 
 Approved recommendations are recorded as positive examples. Rejected recommendations become negative examples. Stale or drifted recommendations are recorded separately so the agent can avoid blindly reusing old approval context when the environment changes.
 
+## AI Usage Boundary
+
+AI is only used during recommendation drafting, and only when local Ollama/Qwen generation is enabled with `USE_QWEN=true`.
+
+The agent does not use AI to:
+
+- Decide which cases to pull from TheHive.
+- Query or modify TheHive.
+- Decide which cases qualify as false positives or duplicates.
+- Build cluster keys.
+- Classify alert buckets.
+- Approve recommendations.
+- Deploy tuning changes.
+
+Those steps are handled by deterministic Python logic, keyword matching, local configuration, and human analyst decisions.
+
+When enabled, Qwen receives the already-selected case cluster and local knowledge-base context, then drafts recommendation fields such as:
+
+- Why the cases appear related.
+- Suggested tuning.
+- Proposed logic.
+- Expected impact.
+- Risk assessment.
+- Validation steps.
+- Safety notes.
+
+The drafted output is still checked by deterministic safety validation. If the draft appears too broad or misses required context, the recommendation is downgraded to `REVIEW`.
+
 ## Safety Guardrails
 
 The MVP uses several guardrails to keep recommendations narrow:
@@ -180,6 +208,44 @@ cp .env.example .env
 
 Then fill in `.env` with the appropriate local values.
 
+## Contributor Ollama Setup
+
+Contributors can run the recommendation-generation path with a local Ollama model. This keeps LLM testing local and avoids sending case context to an external model provider.
+
+Install Ollama from:
+
+```text
+https://ollama.com
+```
+
+Pull the default model used by this project:
+
+```bash
+ollama pull qwen2.5:7b
+```
+
+Start Ollama:
+
+```bash
+ollama serve
+```
+
+Configure `.env`:
+
+```bash
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+USE_QWEN=true
+```
+
+If contributors do not want to use Ollama, leave Qwen disabled:
+
+```bash
+USE_QWEN=false
+```
+
+When `USE_QWEN=false`, or when Ollama is unavailable, the agent falls back to a conservative review-required recommendation instead of failing open.
+
 ## Running the Agent
 
 Generate and send tuning recommendations:
@@ -257,4 +323,3 @@ Potential next steps:
 - Add CI checks for formatting, linting, and secret scanning.
 - Add integration tests with mocked TheHive, Discord, and Apps Script endpoints.
 - Add support for exporting approval records to a formal change-management system.
-
