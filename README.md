@@ -61,6 +61,66 @@ The current implementation supports:
 11. An analyst responds with `APPROVE`, `REJECT`, `REVIEW`, `STALE`, or `DRIFT`.
 12. `approval_bot.py` updates local state and the appropriate knowledge-base lane.
 
+## System Topology
+
+```mermaid
+flowchart LR
+    subgraph HOMELAB[Homelab / Local Trust Boundary]
+        HIVE[TheHive Cases]
+        AGENT[tuning_agent.py]
+        CLUSTER[Local Filtering, Clustering, and Bucketing]
+        FEATURES[feature_extractor.py<br/>Identifier-Free Features]
+        REDACT[redactor.py<br/>Recursive Redaction]
+        GUARD[leakage_guard.py<br/>Fail-Closed Inspection]
+        PIPELINE[ai_pipeline.py<br/>Schema and Token Limits]
+        LOCALLOG[ai_usage.jsonl<br/>Hashed Usage and Cost]
+        STATE[sent_recommendations.json]
+        KB[Local Markdown Knowledge Base]
+        BOT[approval_bot.py]
+
+        HIVE --> AGENT --> CLUSTER --> FEATURES --> REDACT --> GUARD --> PIPELINE
+        PIPELINE --> LOCALLOG
+        AGENT --> STATE
+        BOT --> STATE
+        BOT --> KB
+    end
+
+    subgraph GOOGLE[Google Cloud]
+        ADC[Application Default Credentials<br/>Service-Account Impersonation]
+        VERTEX[Vertex AI<br/>Gemini 2.5 Flash]
+        SHEET[Google Sheet<br/>Approved Records Only]
+
+        ADC --> VERTEX
+    end
+
+    subgraph REVIEW[Human Review]
+        DISCORD[Discord Recommendation Channel]
+        ANALYST[Analyst / Approver]
+
+        DISCORD --> ANALYST
+        ANALYST --> BOT
+    end
+
+    PIPELINE -->|Minimal allowlisted JSON only| VERTEX
+    VERTEX -->|Structured advisory result| AGENT
+    AGENT -->|Recommendation and estimated cost| DISCORD
+    BOT -->|APPROVE only| SHEET
+```
+
+### Data boundary
+
+| Boundary | Data allowed |
+| --- | --- |
+| TheHive to local agent | Full case data over the homelab connection. |
+| Local agent to Vertex AI | Alert bucket, counts, booleans, disposition, and allowlisted context/risk flags only. |
+| Vertex AI to local agent | Advisory decision, rationale, risk, validation steps, and token metadata. |
+| Local agent to Discord | Human-readable recommendation, local evidence, AI decision, safety notes, and estimated cost. |
+| Approval bot to Google Sheet | Approved recommendation record only. Rejected/review/stale decisions remain local. |
+
+Users, hosts, IP addresses, paths, command lines, process names, rule IDs, case IDs,
+analyst notes, raw cases, and knowledge-base documents are excluded from the Vertex
+AI request.
+
 ## Human Approval Model
 
 The agent is intentionally advisory. It does not directly deploy tuning changes.
