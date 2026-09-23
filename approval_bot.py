@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import datetime as dt
 
@@ -21,7 +20,10 @@ print(f"[DEBUG] approval_bot.py path: {__file__}")
 print(f"[DEBUG] STATE_FILE: {STATE_FILE}")
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-APPROVAL_CHANNEL_ID = int(os.getenv("APPROVAL_CHANNEL_ID", "0"))
+APPROVAL_CHANNEL_ID = int(
+    os.getenv("APPROVAL_CHANNEL_ID")
+    or os.getenv("DISCORD_APPROVAL_CHANNEL_ID", "0")
+)
 
 APPS_SCRIPT_WEBHOOK_URL = os.getenv("APPS_SCRIPT_WEBHOOK_URL")
 APPS_SCRIPT_SECRET = os.getenv("APPS_SCRIPT_SECRET")

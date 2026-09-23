@@ -1,13 +1,23 @@
 import json
 
 
+def _case_analysis_text(cases: list[dict]) -> str:
+    """Serialize only analyst-controlled fields, excluding TheHive metadata."""
+    allowed_fields = ["title", "description", "summary", "tags"]
+    relevant_cases = [
+        {field: case.get(field) for field in allowed_fields if case.get(field)}
+        for case in cases
+    ]
+    return json.dumps(relevant_cases, default=str).lower()
+
+
 def classify_alert_bucket(cluster_key: str, cases: list[dict]) -> dict:
     """
     Classify a case cluster into an alert bucket.
     Returns bucket metadata used by the tuning agent.
     """
 
-    combined_text = json.dumps(cases, default=str).lower()
+    combined_text = _case_analysis_text(cases)
     cluster_text = cluster_key.lower()
     text = f"{cluster_text} {combined_text}"
 

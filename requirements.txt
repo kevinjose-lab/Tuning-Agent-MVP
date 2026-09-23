@@ -1,4 +1,4 @@
 discord.py
 python-dotenv
 requests
-
+google-genai>=1.0,<2

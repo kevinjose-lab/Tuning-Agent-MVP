@@ -6,10 +6,10 @@ __pycache__/
 
 # Local runtime state and generated files
 sent_recommendations.json
+ai_usage.jsonl
 *.bak.*
 
 # OS/editor noise
 .DS_Store
 .idea/
 .vscode/
-

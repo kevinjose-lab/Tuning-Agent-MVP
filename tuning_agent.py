@@ -3,13 +3,16 @@ import os
 import json
 import hashlib
 import datetime as dt
+import re
 from collections import defaultdict
 
 import requests
 from dotenv import load_dotenv
 
 from pathlib import Path
-from knowledge_retriever import retrieve_knowledge
+from ai_pipeline import get_provider, run_ai_pipeline
+from ai_usage import write_usage_record
+from feature_extractor import extract_ai_features
 from alert_bucket import classify_alert_bucket
 
 env_path = Path(__file__).resolve().parent / ".env"
@@ -19,14 +22,21 @@ THEHIVE_URL = os.getenv("THEHIVE_URL", "").rstrip("/")
 THEHIVE_API_KEY = os.getenv("THEHIVE_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-USE_QWEN = os.getenv("USE_QWEN", "false").lower() == "true"
+AI_MODE = os.getenv("AI_MODE", "redaction-only").lower()
+AI_INPUT_COST_PER_MILLION_TOKENS = float(
+    os.getenv("AI_INPUT_COST_PER_MILLION_TOKENS", "0")
+)
+AI_OUTPUT_COST_PER_MILLION_TOKENS = float(
+    os.getenv("AI_OUTPUT_COST_PER_MILLION_TOKENS", "0")
+)
+AI_MAX_INPUT_TOKENS = int(os.getenv("AI_MAX_INPUT_TOKENS", "1000"))
+AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "500"))
 
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "14"))
 MIN_OCCURRENCES = int(os.getenv("MIN_OCCURRENCES", "5"))
 
 STATE_FILE = Path(__file__).resolve().parent / "sent_recommendations.json"
+AI_USAGE_FILE = Path(__file__).resolve().parent / "ai_usage.jsonl"
 
 print("Discord webhook loaded:", bool(DISCORD_WEBHOOK_URL))
 print("Current working directory:", os.getcwd())
@@ -67,17 +77,54 @@ def case_matches_fp_or_duplicate(case: dict) -> bool:
     """Return True when a case contains language/tags that indicate FP or duplicate."""
     text = json.dumps(case).lower()
 
-    fp_terms = [
+    disposition_terms = [
         "false positive",
         "false_positive",
-        "fp",
         "duplicate",
         "duplicated",
         "disposition:false-positive",
         "disposition:duplicate",
     ]
 
-    return any(term in text for term in fp_terms)
+    if any(term in text for term in disposition_terms):
+        return True
+
+    # Accept FP as a standalone tag/token, but do not match unrelated words such
+    # as "Proofpoint" that happen to contain the letters "fp".
+    return re.search(r"(?<![a-z0-9])fp(?![a-z0-9])", text) is not None
+
+
+def case_is_within_lookback(
+    case: dict,
+    lookback_days: int = LOOKBACK_DAYS,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Return whether a case creation timestamp falls inside the lookback window.
+
+    TheHive commonly returns epoch milliseconds in ``_createdAt``. ISO-8601 and
+    epoch-second values are accepted as well. Cases without a usable timestamp
+    are retained so schema differences do not silently hide candidates.
+    """
+    raw_timestamp = case.get("_createdAt", case.get("createdAt"))
+    if raw_timestamp in (None, ""):
+        return True
+
+    try:
+        if isinstance(raw_timestamp, (int, float)):
+            seconds = raw_timestamp / 1000 if raw_timestamp > 10_000_000_000 else raw_timestamp
+            created_at = dt.datetime.fromtimestamp(seconds, tz=dt.UTC)
+        else:
+            timestamp_text = str(raw_timestamp).strip().replace("Z", "+00:00")
+            created_at = dt.datetime.fromisoformat(timestamp_text)
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=dt.UTC)
+            else:
+                created_at = created_at.astimezone(dt.UTC)
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+    reference_time = now or dt.datetime.now(dt.UTC)
+    return created_at >= reference_time - dt.timedelta(days=lookback_days)
 
 
 def build_cluster_key(case: dict) -> str:
@@ -210,159 +257,17 @@ def get_case_reference(case: dict) -> str:
     return "unknown"
 
 
-def build_qwen_tuning_prompt(cluster_key: str, cases: list[dict]) -> str:
-    rule_id, agent, indicator = cluster_key.split("|", 2)
-    bucket_info = classify_alert_bucket(cluster_key, cases)
-    knowledge_context = retrieve_knowledge(
-        f"{rule_id} {agent} {indicator} tuning false positive duplicate suppression"
-    )
-
-    case_summaries = []
-
-    for case in cases[:10]:
-        case_ref = get_case_reference(case)
-        title = case.get("title", "No title")
-        tags = case.get("tags", [])
-        summary = case.get("summary", case.get("description", ""))
-
-        case_summaries.append(
-            f"- Case: {case_ref}\n"
-            f"  Title: {title}\n"
-            f"  Tags: {tags}\n"
-            f"  Summary/Notes: {summary}"
-        )
-
-    joined_cases = "\n".join(case_summaries)
-
-    return f"""
-You are a Senior SOC detection tuning analyst.
-
-Use the internal tuning knowledge below to draft a tuning recommendation.
-
-Knowledge Context:
-{knowledge_context}
-
-Case Cluster Context:
-- Detection source: Wazuh
-- Rule ID: {rule_id}
-- Agent/Host: {agent}
-- Correlation indicator: {indicator}
-- Case count: {len(cases)}
-- These cases were closed as False Positive or Duplicate.
-- The output is for human approval only.
-
-Alert Bucket:
-- Bucket: {bucket_info["bucket"]}
-- Label: {bucket_info["label"]}
-- Preferred Grouping: {bucket_info["preferred_grouping"]}
-- Tuning Goal: {bucket_info["tuning_goal"]}
-
-Bucket-Specific Rules:
-- If bucket is vulnerability: group by agent + CVE + package. Do not hide the vulnerability from inventory.
-- If bucket is IOC: do not tune malicious indicators unless confirmed benign/allowlisted.
-- If bucket is authentication: preserve visibility for privileged users, new source IPs, external sources, and high failure volume.
-- If bucket is endpoint_process: never broadly suppress PowerShell, LOLBins, Office-child processes, or encoded commands.
-- If bucket is cloud: preserve visibility for new principals, new regions, sensitive IAM actions, and public exposure changes.
-- If bucket is network: preserve visibility for new destinations, unusual ports, and suspicious protocols.
-- If bucket is email: do not suppress broad phishing detections; tune only known benign sender/campaign patterns.
-- If bucket is identity_privilege: treat privilege changes as high risk and prefer REVIEW unless clearly approved admin workflow.
-
-Cases:
-{joined_cases}
-
-Rules:
-- Do not suppress an entire rule globally.
-- Do not suppress all activity from a host.
-- Do not suppress all PowerShell or all vulnerability detections.
-- Proposed logic must be narrow.
-- Proposed logic must include the rule ID.
-- Proposed logic must include the host/agent if available.
-- Proposed logic must include the correlation indicator if available.
-- Include a risk or blind spot.
-- Include validation steps.
-- If this should not be tuned, set recommended_decision to "REVIEW" or "REJECT".
-
-Return valid JSON only. No markdown outside JSON.
-
-JSON schema:
-{{
-  "recommended_decision": "APPROVE|REVIEW|REJECT",
-  "why_related": "string",
-  "recommended_tuning": "string",
-  "proposed_logic": "string",
-  "expected_impact": "string",
-  "risk": "string",
-  "validation_steps": ["string", "string", "string"],
-  "safety_notes": "string"
-}}
-"""
-
-
-def ask_qwen_json(prompt: str) -> dict:
-    if not USE_QWEN:
-        return {
-            "recommended_decision": "REVIEW",
-            "why_related": "Qwen assessment disabled.",
-            "recommended_tuning": "Template-only recommendation generated.",
-            "proposed_logic": "",
-            "expected_impact": "Review required.",
-            "risk": "Risk assessment unavailable because Qwen is disabled.",
-            "validation_steps": ["Manually validate before approval."],
-            "safety_notes": "LLM disabled."
-        }
-
-    if not OLLAMA_URL:
-        return {
-            "recommended_decision": "REVIEW",
-            "why_related": "Qwen assessment unavailable: OLLAMA_URL is not configured.",
-            "recommended_tuning": "Template-only recommendation generated.",
-            "proposed_logic": "",
-            "expected_impact": "Review required.",
-            "risk": "Risk assessment unavailable.",
-            "validation_steps": ["Manually validate before approval."],
-            "safety_notes": "Ollama URL missing."
-        }
-
-    try:
-        response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-
-        raw = response.json().get("response", "").strip()
-        return json.loads(raw)
-
-    except Exception as exc:
-        return {
-            "recommended_decision": "REVIEW",
-            "why_related": f"Qwen JSON generation failed: {exc}",
-            "recommended_tuning": "Template-only fallback required.",
-            "proposed_logic": "",
-            "expected_impact": "Review required.",
-            "risk": "Could not generate LLM risk assessment.",
-            "validation_steps": ["Manually validate before approval."],
-            "safety_notes": "Qwen failed or returned invalid JSON."
-        }
-
-def validate_qwen_tuning(qwen_result: dict, rule_id: str, agent: str, indicator: str) -> list[str]:
+def validate_ai_analysis(ai_result: dict) -> list[str]:
     issues = []
 
-    recommended_decision = str(qwen_result.get("recommended_decision", "REVIEW")).upper()
+    recommended_decision = str(ai_result.get("recommended_decision", "REVIEW")).upper()
 
     if recommended_decision in ["REVIEW", "REJECT"]:
         return issues
 
     combined = " ".join([
-        str(qwen_result.get("recommended_tuning", "")),
-        str(qwen_result.get("proposed_logic", "")),
-        str(qwen_result.get("risk", "")),
+        str(ai_result.get("why_related", "")),
+        str(ai_result.get("risk", "")),
     ]).lower()
 
     dangerous_phrases = [
@@ -380,48 +285,65 @@ def validate_qwen_tuning(qwen_result: dict, rule_id: str, agent: str, indicator:
         if phrase in combined:
             issues.append(f"Unsafe broad tuning phrase detected: {phrase}")
 
-    if rule_id.lower() not in combined:
-        issues.append("Proposed tuning does not reference the rule ID.")
-
-    if agent and agent != "unknown_agent" and agent.lower() not in combined:
-        issues.append("Proposed tuning does not reference the agent/host.")
-
-    indicator_value = indicator.split(":", 1)[-1].lower()
-    if indicator_value and indicator_value != "generic" and indicator_value not in combined:
-        issues.append("Proposed tuning does not reference the correlation indicator.")
-
     return issues
 
 def build_recommendation(cluster_key: str, cases: list[dict]) -> tuple[str, str, str, dict]:
-    """Turn a repeated case cluster into a Discord message and proposed Wazuh logic."""
+    """Build a recommendation while keeping raw case data outside the AI boundary."""
     rec_id = recommendation_id(cluster_key)
     rule_id, agent, indicator = cluster_key.split("|", 2)
     bucket_info = classify_alert_bucket(cluster_key, cases)
     case_ids = [get_case_reference(c) for c in cases[:10]]
     case_count = len(cases)
 
-    qwen_prompt = build_qwen_tuning_prompt(cluster_key, cases)
-    qwen_result = ask_qwen_json(qwen_prompt)
-
-    safety_issues = validate_qwen_tuning(
-        qwen_result=qwen_result,
-        rule_id=rule_id,
-        agent=agent,
-        indicator=indicator,
+    request = extract_ai_features(cluster_key, cases, LOOKBACK_DAYS)
+    pipeline_result = run_ai_pipeline(
+        request=request,
+        provider=get_provider(AI_MODE, max_output_tokens=AI_MAX_OUTPUT_TOKENS),
+        known_sensitive_values=[rule_id, agent, indicator, *case_ids],
+        max_input_tokens=AI_MAX_INPUT_TOKENS,
+        max_output_tokens=AI_MAX_OUTPUT_TOKENS,
     )
+    analysis = pipeline_result.analysis
+    ai_result = {
+        "recommended_decision": analysis.decision,
+        "why_related": analysis.rationale,
+        "recommended_tuning": "Use exact-match local tuning only after analyst approval.",
+        "expected_impact": "Potential reduction of repeated cases within the exact local scope.",
+        "risk": analysis.risk,
+        "validation_steps": analysis.validation_steps,
+        "safety_notes": analysis.safety_notes,
+        "provider": analysis.provider,
+        "model": analysis.model,
+        "input_tokens": analysis.input_tokens,
+        "output_tokens": analysis.output_tokens,
+        "blocked_categories": pipeline_result.blocked_categories,
+    }
+    usage_record = write_usage_record(
+        path=AI_USAGE_FILE,
+        recommendation_id=rec_id,
+        provider=analysis.provider,
+        model=analysis.model,
+        input_tokens=analysis.input_tokens,
+        output_tokens=analysis.output_tokens,
+        input_cost_per_million=AI_INPUT_COST_PER_MILLION_TOKENS,
+        output_cost_per_million=AI_OUTPUT_COST_PER_MILLION_TOKENS,
+        blocked_categories=pipeline_result.blocked_categories,
+    )
+    ai_result["estimated_cost_usd"] = usage_record.estimated_cost_usd
 
+    safety_issues = validate_ai_analysis(ai_result)
     if safety_issues:
-        qwen_result["recommended_decision"] = "REVIEW"
-        qwen_result["safety_notes"] = (
-            qwen_result.get("safety_notes", "")
+        ai_result["recommended_decision"] = "REVIEW"
+        ai_result["safety_notes"] = (
+            ai_result.get("safety_notes", "")
             + "\nSafety validation issues:\n- "
             + "\n- ".join(safety_issues)
         )
 
-    recommended_decision = str(qwen_result.get("recommended_decision", "REVIEW")).upper()
-    proposed_logic = qwen_result.get("proposed_logic", "").strip()
+    recommended_decision = str(ai_result.get("recommended_decision", "REVIEW")).upper()
+    proposed_logic = ""
 
-    if not proposed_logic and recommended_decision == "APPROVE":
+    if recommended_decision == "APPROVE":
         proposed_logic = (
             f'<rule id="100238" level="13" frequency="2" timeframe="86400" ignore="86400">\n'
             f'  <if_matched_sid>{rule_id}</if_matched_sid>\n'
@@ -431,18 +353,12 @@ def build_recommendation(cluster_key: str, cases: list[dict]) -> tuple[str, str,
             f'</rule>'
     )
 
-    if not proposed_logic and recommended_decision in ["REVIEW", "REJECT"]:
+    if recommended_decision in ["REVIEW", "REJECT"]:
         proposed_logic = (
-        "No tuning logic generated because the LLM recommended "
-        f"{recommended_decision}. This activity should remain under investigation or review."
-    )
+            "No tuning logic generated because the analysis recommended "
+            f"{recommended_decision}. This activity should remain under investigation or review."
+        )
         
-    validation_steps = qwen_result.get("validation_steps", [])
-    if isinstance(validation_steps, list):
-        validation_steps_text = "\n".join(f"- {step}" for step in validation_steps)
-    else:
-        validation_steps_text = str(validation_steps)
-
     message = (
         f"**Recommendation ID:** `{rec_id}`\n\n"
         f"**Detection / Rule**\n"
@@ -466,21 +382,21 @@ def build_recommendation(cluster_key: str, cases: list[dict]) -> tuple[str, str,
         f"- Case Count: `{case_count}`\n"
         f"- Example Case IDs: `{', '.join(case_ids)}`\n\n"
         f"**Why These Cases Appear Related**\n"
-        f"{qwen_result.get('why_related', 'Review required.')}\n\n"
+        f"{ai_result.get('why_related', 'Review required.')}\n\n"
         f"**Suggested Tuning**\n"
-        f"{qwen_result.get('recommended_tuning', 'Review required.')}\n\n"
+        f"{ai_result.get('recommended_tuning', 'Review required.')}\n\n"
         f"**Proposed Logic**\n"
         f"```xml\n{proposed_logic}\n```\n\n"
-        f"**Expected Impact**\n"
-        f"{qwen_result.get('expected_impact', 'Review required.')}\n\n"
-        f"**Risk Assessment**\n"
-        f"{qwen_result.get('risk', 'Risk review required.')}\n\n"
-        f"**Validation Steps**\n"
-        f"{validation_steps_text}\n\n"
-        f"**LLM Recommended Decision**\n"
-        f"`{qwen_result.get('recommended_decision', 'REVIEW')}`\n\n"
+        f"**AI Analysis Mode**\n"
+        f"`{ai_result.get('provider', 'disabled')}` / `{ai_result.get('model', 'none')}`\n\n"
+        f"**AI Recommended Decision**\n"
+        f"`{ai_result.get('recommended_decision', 'REVIEW')}`\n\n"
+        f"**AI Usage / Estimated Cost**\n"
+        f"- Input Tokens: `{ai_result.get('input_tokens', 0)}`\n"
+        f"- Output Tokens: `{ai_result.get('output_tokens', 0)}`\n"
+        f"- Estimated Cost (USD): `${ai_result.get('estimated_cost_usd', 0):.8f}`\n\n"
         f"**Safety Notes**\n"
-        f"{qwen_result.get('safety_notes', 'None')}\n\n"
+        f"{ai_result.get('safety_notes', 'None')}\n\n"
         f"**Human Approval Needed**\n"
         f"Reply with one of:\n\n"
         f"`APPROVE {rec_id} <why this is safe>`\n"
@@ -494,7 +410,7 @@ def build_recommendation(cluster_key: str, cases: list[dict]) -> tuple[str, str,
         f"- Use `DRIFT` when a similar tuning may have been valid before, but the current alert changed, such as version, path, user, parent process, cloud resource, region, or indicator.\n"
     )
 
-    return rec_id, message, proposed_logic, qwen_result
+    return rec_id, message, proposed_logic, ai_result
 
 
 def load_state() -> dict:
@@ -533,7 +449,10 @@ def main():
     print(f"Loaded cases: {len(cases)}")
     print(f"MIN_OCCURRENCES: {MIN_OCCURRENCES}")
 
-    candidates = [case for case in cases if case_matches_fp_or_duplicate(case)]
+    recent_cases = [case for case in cases if case_is_within_lookback(case)]
+    print(f"Cases inside {LOOKBACK_DAYS}-day lookback: {len(recent_cases)}")
+
+    candidates = [case for case in recent_cases if case_matches_fp_or_duplicate(case)]
     print(f"FP/Duplicate candidates: {len(candidates)}")
 
     grouped = defaultdict(list)
@@ -554,7 +473,7 @@ def main():
             continue
 
         # Build and send one human-reviewable recommendation for each qualifying cluster.
-        rec_id, message, proposed_logic, qwen_result = build_recommendation(cluster_key, grouped_cases)
+        rec_id, message, proposed_logic, ai_result = build_recommendation(cluster_key, grouped_cases)
         print(f"Sending recommendation {rec_id}")
         post_discord(message)
 
@@ -584,9 +503,14 @@ def main():
             "risk": "Medium-Low",
 
             "case_refs": [get_case_reference(c) for c in grouped_cases[:10]],
-            "llm_recommended_decision": qwen_result.get("recommended_decision", "REVIEW"),
-            "llm_safety_notes": qwen_result.get("safety_notes", ""),
-            "qwen_generated": True,
+            "ai_recommended_decision": ai_result.get("recommended_decision", "REVIEW"),
+            "ai_safety_notes": ai_result.get("safety_notes", ""),
+            "ai_provider": ai_result.get("provider", "disabled"),
+            "ai_model": ai_result.get("model", "none"),
+            "ai_input_tokens": ai_result.get("input_tokens", 0),
+            "ai_output_tokens": ai_result.get("output_tokens", 0),
+            "ai_estimated_cost_usd": ai_result.get("estimated_cost_usd", 0),
+            "ai_blocked_categories": ai_result.get("blocked_categories", []),
 
             "alert_bucket": bucket_info.get("bucket"),
             "alert_bucket_label": bucket_info.get("label"),
